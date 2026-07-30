@@ -24,6 +24,8 @@ struct ImmersionSlider: View {
                             .clipShape(RoundedRectangle(cornerRadius: 6))
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("Immersion \(levelLabel(level))")
+                    .accessibilityAddTraits(level == current ? [.isSelected] : [])
                 }
             }
         }

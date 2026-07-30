@@ -4,6 +4,7 @@ import Foundation
 @MainActor
 final class BLETransport: NSObject, NuraTransport {
     weak var delegate: NuraTransportDelegate?
+    var autoResetOnConnect = false   // not used on BLE; classic transport only
 
     private(set) var phase: ConnectionPhase = .idle {
         didSet { delegate?.transportDidUpdatePhase(phase) }
@@ -18,12 +19,14 @@ final class BLETransport: NSObject, NuraTransport {
     private var pendingAck: UInt16 = 0
     private var pendingMinLen: Int = 0
     private var pendingCompletion: ((Result<[UInt8], Error>) -> Void)?
+    private var pendingRawCompletion: ((Result<GaiaResponse, Error>) -> Void)?
     private var pendingFrame: Data?
     private var writeRetries = 0
     private let maxRetries = 10
     private var pollTimer: Timer?
     private var pollAttempts = 0
     private let maxPollAttempts = 80
+    private var seenDeviceNames: Set<String> = []
 
     override init() {
         super.init()
@@ -39,7 +42,29 @@ final class BLETransport: NSObject, NuraTransport {
         peripheral = nil
         cmdChar = nil
         rspChar = nil
+        seenDeviceNames.removeAll()
         phase = .scanning
+
+        // A nuraphone that is already connected to the Mac (e.g. for audio)
+        // often doesn't advertise over BLE, so a scan never finds it. Ask the
+        // system for already-connected peripherals exposing the GAIA service
+        // first, and only fall back to scanning.
+        let connected = central.retrieveConnectedPeripherals(withServices: [gaiaServiceUUID])
+        if let p = connected.first {
+            delegate?.transportDidLog("BLE: Using already-connected \"\(p.name ?? "<no name>")\"")
+            phase = .connecting
+            peripheral = p
+            p.delegate = self
+            central.connect(
+                p,
+                options: [
+                    CBConnectPeripheralOptionNotifyOnConnectionKey: true,
+                    CBConnectPeripheralOptionNotifyOnDisconnectionKey: true,
+                ]
+            )
+            return
+        }
+
         delegate?.transportDidLog("BLE: Scanning for nuraphone...")
         central.scanForPeripherals(
             withServices: nil,
@@ -54,9 +79,12 @@ final class BLETransport: NSObject, NuraTransport {
     func disconnect() {
         stopPolling()
         let cb = pendingCompletion
+        let rawCb = pendingRawCompletion
         pendingCompletion = nil
+        pendingRawCompletion = nil
         pendingAck = 0
         cb?(.failure(NuraError.notReady))
+        rawCb?(.failure(NuraError.notReady))
         if let p = peripheral { central.cancelPeripheralConnection(p) }
         peripheral = nil
         cmdChar = nil
@@ -82,7 +110,46 @@ final class BLETransport: NSObject, NuraTransport {
         writeFrame()
     }
 
+    func sendRawFrameCapturingResponse(
+        commandId: UInt16,
+        payload: [UInt8],
+        completion: @escaping (Result<GaiaResponse, Error>) -> Void
+    ) {
+        guard cmdChar != nil, rspChar != nil else {
+            completion(.failure(NuraError.notReady))
+            return
+        }
+        guard pendingCompletion == nil, pendingRawCompletion == nil else {
+            completion(.failure(NuraError.busy))
+            return
+        }
+        pendingRawCompletion = completion
+        pendingAck = 0
+        pendingMinLen = 0
+        writeRetries = 0
+        pendingFrame = GaiaFrame(commandId: commandId, payload: payload).bleData
+        writeFrame()
+    }
+
     // MARK: - Internal
+
+    private var hasPending: Bool {
+        pendingCompletion != nil || pendingRawCompletion != nil
+    }
+
+    private func failPending(_ error: Error) {
+        stopPolling()
+        pendingAck = 0
+        if let cb = pendingCompletion {
+            pendingCompletion = nil
+            cb(.failure(error))
+            return
+        }
+        if let cb = pendingRawCompletion {
+            pendingRawCompletion = nil
+            cb(.failure(error))
+        }
+    }
 
     private func writeFrame() {
         guard let ch = cmdChar, let p = peripheral, let frame = pendingFrame
@@ -107,17 +174,13 @@ final class BLETransport: NSObject, NuraTransport {
     }
 
     private func pollTick() {
-        guard pendingCompletion != nil else {
+        guard hasPending else {
             stopPolling()
             return
         }
         pollAttempts += 1
         if pollAttempts >= maxPollAttempts {
-            stopPolling()
-            let cb = pendingCompletion
-            pendingCompletion = nil
-            pendingAck = 0
-            cb?(.failure(NuraError.timeout))
+            failPending(NuraError.timeout)
         }
     }
 
@@ -127,6 +190,14 @@ final class BLETransport: NSObject, NuraTransport {
         pendingCompletion = nil
         pendingAck = 0
         cb?(.success(payload))
+    }
+
+    private func resolveRawResponse(_ response: GaiaResponse) {
+        stopPolling()
+        let cb = pendingRawCompletion
+        pendingRawCompletion = nil
+        pendingAck = 0
+        cb?(.success(response))
     }
 }
 
@@ -171,12 +242,30 @@ extension BLETransport: CBCentralManagerDelegate {
             peripheral.name
             ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String)
             ?? "<no name>"
+        let advertisedServices = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
         var match = name.lowercased().contains("nuraphone")
+        if !match {
+            // Any device advertising the Qualcomm GAIA service is a candidate,
+            // regardless of the name it broadcasts.
+            match = advertisedServices.contains(gaiaServiceUUID)
+        }
         if !match,
             let mfg = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data
         {
             match = [UInt8](mfg).suffix(6) == ArraySlice(nuraphoneBdAddrSuffix)
         }
+
+        MainActor.assumeIsolated {
+            // Diagnostic: log every distinct device seen while scanning, so an
+            // unrecognised nuraphone name shows up in the log.
+            if self.seenDeviceNames.insert(name).inserted {
+                let svc = advertisedServices.isEmpty
+                    ? ""
+                    : " services=[\(advertisedServices.map { $0.uuidString }.joined(separator: ", "))]"
+                delegate?.transportDidLog("  saw device: \"\(name)\"\(svc)")
+            }
+        }
+
         guard match else { return }
 
         MainActor.assumeIsolated {
@@ -224,7 +313,10 @@ extension BLETransport: CBCentralManagerDelegate {
         error: Error?
     ) {
         MainActor.assumeIsolated {
-            stopPolling()
+            // Resolve any in-flight request so awaiting callers (e.g. the
+            // provisioning relay) don't hang when the device drops. Safe/no-op
+            // after a manual disconnect(), which already cleared the callbacks.
+            failPending(NuraError.notReady)
             cmdChar = nil
             rspChar = nil
             self.peripheral = nil
@@ -323,7 +415,7 @@ extension BLETransport: CBPeripheralDelegate {
 
         MainActor.assumeIsolated {
             if let e = capturedError {
-                if uuid == gaiaResponseUUID, pendingCompletion != nil { return }
+                if uuid == gaiaResponseUUID, hasPending { return }
                 delegate?.transportDidLog("Value error (\(uuid)): \(e.localizedDescription)")
                 return
             }
@@ -344,6 +436,12 @@ extension BLETransport: CBPeripheralDelegate {
                     response.rawCommandId, response.payload.count, hexStr(Data(response.payload))
                 )
             )
+
+            // Provisioning relay: accept the next non-indication frame as-is.
+            if pendingRawCompletion != nil {
+                resolveRawResponse(response)
+                return
+            }
 
             if response.rawCommandId == pendingAck {
                 if response.payload.count < pendingMinLen {
@@ -389,10 +487,7 @@ extension BLETransport: CBPeripheralDelegate {
                         self.writeFrame()
                     }
                 } else {
-                    stopPolling()
-                    let cb = pendingCompletion
-                    pendingCompletion = nil
-                    cb?(.failure(e))
+                    failPending(e)
                 }
             }
         }

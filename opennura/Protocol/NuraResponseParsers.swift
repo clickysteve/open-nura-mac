@@ -89,6 +89,28 @@ enum NuraResponseParsers {
         )
     }
 
+    /// Decodes the hearing-profile visualisation payload (command 0x00B8).
+    /// Layout: 1 valid flag, 4-byte colour float, then 12 big-endian floats for
+    /// the left ear followed by 12 for the right (101 bytes total).
+    static func decodeVisualisationData(_ payload: [UInt8]) -> NuraProfileVisualisation? {
+        let expectedLength = 1 + 4 + (12 * 4) + (12 * 4)
+        guard payload.count == expectedLength else { return nil }
+
+        var left = [Double](repeating: 0, count: 12)
+        var right = [Double](repeating: 0, count: 12)
+        for index in 0..<12 {
+            left[index] = Double(readFloatBE(payload, 5 + index * 4))
+            right[index] = Double(readFloatBE(payload, 53 + index * 4))
+        }
+
+        return NuraProfileVisualisation(
+            valid: payload[0] != 0x00,
+            colour: Double(readFloatBE(payload, 1)),
+            left: left,
+            right: right
+        )
+    }
+
     static func decodeDialConfiguration(_ payload: [UInt8]) -> NuraDialConfiguration? {
         let normalized: [UInt8]
         switch payload.count {
@@ -111,5 +133,13 @@ enum NuraResponseParsers {
 
     private static func readUInt16BE(_ bytes: [UInt8], _ offset: Int) -> Int {
         (Int(bytes[offset]) << 8) | Int(bytes[offset + 1])
+    }
+
+    private static func readFloatBE(_ bytes: [UInt8], _ offset: Int) -> Float {
+        let bits = (UInt32(bytes[offset]) << 24)
+            | (UInt32(bytes[offset + 1]) << 16)
+            | (UInt32(bytes[offset + 2]) << 8)
+            | UInt32(bytes[offset + 3])
+        return Float(bitPattern: bits)
     }
 }

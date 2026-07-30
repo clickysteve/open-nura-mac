@@ -235,6 +235,28 @@ struct NuraDeviceInfo: Equatable {
     var firmwareVersion: Int
 }
 
+// MARK: - Profile visualisation (hearing-profile "signature" data)
+
+/// The raw per-profile hearing signature the headphones store. This is read
+/// only (command 0x00B8); it plays nothing on the device. `left`/`right` are
+/// 12 values each describing the shape of the personalised profile per ear.
+struct NuraProfileVisualisation: Equatable {
+    var valid: Bool
+    var colour: Double
+    var left: [Double]
+    var right: [Double]
+
+    /// A single combined curve (mean of left and right at each point), which is
+    /// what we plot as the profile shape.
+    var combined: [Double] {
+        let count = min(left.count, right.count)
+        guard count > 0 else { return [] }
+        return (0..<count).map { (left[$0] + right[$0]) * 0.5 }
+    }
+
+    var isEmpty: Bool { left.isEmpty && right.isEmpty }
+}
+
 // MARK: - Headset indication
 
 enum HeadsetIndicationId: UInt8 {

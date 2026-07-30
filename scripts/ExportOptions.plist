@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Developer ID export: a signed .app you can run and distribute outside
+	     the App Store. -->
+	<key>method</key>
+	<string>developer-id</string>
+
+	<!-- Replace with your Apple Developer Team ID (Membership page, or
+	     `xcrun notarytool store-credentials` will show it). -->
+	<key>teamID</key>
+	<string>REPLACE_WITH_TEAM_ID</string>
+
+	<key>signingStyle</key>
+	<string>automatic</string>
+
+	<!-- Xcode can upload for notarisation automatically during export; the
+	     script below also notarises explicitly, so leave this false to avoid
+	     doing it twice. -->
+	<key>manageAppVersionAndBuildNumber</key>
+	<false/>
+</dict>
+</plist>
