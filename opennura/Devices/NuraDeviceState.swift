@@ -16,6 +16,9 @@ final class NuraDeviceState: ObservableObject {
     @Published var buttons: NuraButtonConfiguration?
     @Published var dial: NuraDialConfiguration?
     @Published var kickitEnabled: Bool?
+    /// Hearing-profile visualisation data, keyed by profile id. Populated only
+    /// when the user explicitly asks to view a profile's shape.
+    @Published var visualisations: [Int: NuraProfileVisualisation] = [:]
 
     var ancEnabled: Bool { anc?.ancEnabled ?? false }
     var passthroughEnabled: Bool { anc?.passthroughEnabled ?? false }
@@ -35,5 +38,6 @@ final class NuraDeviceState: ObservableObject {
         buttons = nil
         dial = nil
         kickitEnabled = nil
+        visualisations = [:]
     }
 }

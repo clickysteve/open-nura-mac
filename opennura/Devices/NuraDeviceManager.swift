@@ -7,36 +7,151 @@ final class NuraDeviceManager: NSObject, ObservableObject {
     @Published var phase: ConnectionPhase = .idle
     @Published var logs: [String] = []
 
+    /// When on, connecting first disconnects the headphones' audio link (macOS
+    /// only), so the control handshake is reliable without visiting Bluetooth
+    /// settings. Persisted; on by default.
+    @Published var autoDisconnectAudio: Bool = UserDefaults.standard.object(forKey: "autoDisconnectAudio") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(autoDisconnectAudio, forKey: "autoDisconnectAudio") }
+    }
+
     let state = NuraDeviceState()
+    let provisioning = NuraProvisioningManager()
+
+    /// App-side custom profile names (display only; not sent to the device).
+    @Published var localProfileNames: [Int: String] = [:]
+
+    enum Mode { case control, provision }
+    private var mode: Mode = .control
 
     private var transport: NuraTransport
     private var nuraKey: [UInt8] = []
     private var session: NuraSession?
     private var gaiaCommandBusy = false
     private let configStore = NuraConfigStore()
+    private var batteryTimer: Timer?
+
+    /// True when at least one device key is stored (used to offer auto-connect).
+    var hasSavedDevices: Bool { !configStore.load().devices.isEmpty }
+
+    /// Connects automatically if a device key is already saved and we're idle.
+    func autoConnectIfAvailable() {
+        guard phase.isIdle, hasSavedDevices else { return }
+        connect()
+    }
 
     override init() {
+        // The nuraphone exposes GAIA over classic Bluetooth SPP, which on macOS
+        // is reached via IOBluetooth RFCOMM. iOS can't do RFCOMM to non-MFi
+        // devices, so it falls back to BLE.
+        #if os(macOS)
+        self.transport = ClassicBTTransport()
+        #else
         self.transport = BLETransport()
+        #endif
         super.init()
         self.transport.delegate = self
+    }
+
+    // MARK: - Provisioning (recover device key from the Nura backend)
+
+    /// Connects to the headphones and runs backend-assisted provisioning to
+    /// recover and store the long-lived device key. Requires being signed in.
+    func fetchDeviceKey() {
+        guard phase.isIdle else { return }
+        guard provisioning.isLoggedIn else {
+            addLog("Provisioning: sign in to your Nura account first")
+            provisioning.status = "Sign in to your Nura account first."
+            return
+        }
+        mode = .provision
+        session = nil
+        gaiaCommandBusy = false
+        nuraKey = []
+        state.reset()
+        phase = .scanning
+        addLog("Provisioning: scanning for nuraphone (make sure they're on and worn)...")
+        transport.autoResetOnConnect = autoDisconnectAudio
+        transport.scan()
+    }
+
+    private func runProvisioningRelay(serial: Int, firmware: Int) {
+        phase = .handshaking
+        addLog("Provisioning: recovering device key from Nura backend...")
+        let maxPacket = configStore.load().deviceBySerial(String(serial))?.maxPacketLengthHint ?? 182
+
+        let sender: NuraProvisioningManager.FrameSender = { [weak self] cmd, payload in
+            try await withCheckedThrowingContinuation { continuation in
+                guard let self else {
+                    continuation.resume(throwing: NuraError.notReady)
+                    return
+                }
+                self.transport.sendRawFrameCapturingResponse(commandId: cmd, payload: payload) { result in
+                    switch result {
+                    case .success(let response):
+                        continuation.resume(returning: NuraProvisioningManager.RelayResponse(
+                            vendorId: response.vendorId,
+                            rawCommandId: response.rawCommandId,
+                            payload: response.payload
+                        ))
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }
+
+        Task { @MainActor in
+            do {
+                let key = try await provisioning.recoverDeviceKey(
+                    serial: serial,
+                    firmwareVersion: firmware,
+                    maxPacketLength: maxPacket,
+                    sendFrame: sender
+                )
+                provisioning.saveDeviceKey(
+                    key,
+                    serial: serial,
+                    firmwareVersion: firmware,
+                    maxPacketLength: maxPacket
+                )
+                addLog("Provisioning: device key recovered and saved for serial \(serial)")
+                mode = .control
+                // Continue straight into a normal encrypted session so the
+                // device is immediately usable with the recovered key.
+                if applyConfiguredKey(forSerial: serial) {
+                    runHandshake()
+                } else {
+                    phase = .idle
+                }
+            } catch {
+                addLog("Provisioning failed: \(error.localizedDescription)")
+                phase = .failed("Provisioning failed")
+                mode = .control
+            }
+        }
     }
 
     // MARK: - Connection
 
     func connect() {
         guard phase.isIdle else { return }
+        mode = .control
         session = nil
         gaiaCommandBusy = false
         nuraKey = []
         state.reset()
         phase = .scanning
+        addLog("OpenNura \(AppInfo.displayVersion)")
         addLog("Scanning for nuraphone...")
+        transport.autoResetOnConnect = autoDisconnectAudio
         transport.scan()
     }
 
     func disconnect() {
+        stopBatteryTimer()
         transport.stopScan()
         transport.disconnect()
+        mode = .control
         session = nil
         gaiaCommandBusy = false
         state.reset()
@@ -44,18 +159,51 @@ final class NuraDeviceManager: NSObject, ObservableObject {
         addLog("Disconnected")
     }
 
+    /// Immediately tears the connection down and reports a failure. Used when
+    /// something looks wrong enough that we should stop talking to the device
+    /// rather than send it any more frames.
+    private func abortForSafety(_ reason: String) {
+        stopBatteryTimer()
+        transport.stopScan()
+        transport.disconnect()
+        mode = .control
+        session = nil
+        gaiaCommandBusy = false
+        state.reset()
+        phase = .failed(reason)
+        addLog("Aborted for safety: \(reason)")
+    }
+
+    // MARK: - Battery auto-refresh
+
+    private func startBatteryTimer() {
+        stopBatteryTimer()
+        batteryTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshBattery() }
+        }
+    }
+
+    private func stopBatteryTimer() {
+        batteryTimer?.invalidate()
+        batteryTimer = nil
+    }
+
     // MARK: - ANC
 
     func setAncState(anc: Bool, social: Bool) {
         guard phase.isReady else { return }
         let profileId = UInt8(state.profileId ?? 0)
+        // Optimistic: reflect the new mode immediately so the segmented control
+        // doesn't flicker back to the old value while we wait for the reply.
+        let previous = state.anc
+        state.anc = NuraAncState(ancEnabled: anc, passthroughEnabled: social)
         addLog("-> SetAncState anc=\(anc ? "ON" : "OFF") social=\(social ? "ON" : "OFF")")
         sendEncrypted(opcode: cmdSetAncState, params: [profileId, anc ? 0x01 : 0x00, social ? 0x01 : 0x00]) { [weak self] result in
             switch result {
             case .success:
-                self?.state.anc = NuraAncState(ancEnabled: anc, passthroughEnabled: social)
                 self?.addLog("<- ANC \(anc ? "ON" : "OFF"), Social \(social ? "ON" : "OFF")")
             case .failure(let e):
+                self?.state.anc = previous
                 self?.addLog("<- SetAncState error: \(e.localizedDescription)")
             }
         }
@@ -63,6 +211,15 @@ final class NuraDeviceManager: NSObject, ObservableObject {
 
     func setAncEnabled(_ enabled: Bool) {
         setAncState(anc: enabled, social: state.passthroughEnabled)
+    }
+
+    /// Sets the combined noise mode (Off / ANC / Passthrough).
+    func setAncMode(_ mode: NuraAncMode) {
+        switch mode {
+        case .off: setAncState(anc: false, social: false)
+        case .anc: setAncState(anc: true, social: false)
+        case .passthrough: setAncState(anc: false, social: true)
+        }
     }
 
     func setSocialMode(_ enabled: Bool) {
@@ -99,15 +256,19 @@ final class NuraDeviceManager: NSObject, ObservableObject {
             addLog("Not ready")
             return
         }
-        addLog("-> SetKickitParams level \(level)")
+        // The payload is [profileId, drc, lpf, gain]. Immersion is per-profile,
+        // so this must target the currently selected profile - previously the
+        // profile id was hardcoded to 0, so it only ever affected Profile 1.
+        let profileId = UInt8(state.profileId ?? 0)
+        addLog("-> SetKickitParams profile \(profileId) level \(level)")
         sendEncrypted(
             opcode: cmdSetKickitParams,
-            params: kickitParams(for: level)
+            params: [profileId] + kickitParams(for: level)
         ) { [weak self] result in
             switch result {
             case .success:
                 self?.state.immersionLevel = level
-                self?.addLog("<- Immersion set to \(level)")
+                self?.addLog("<- Immersion set to \(level) (profile \(profileId))")
             case .failure(let e):
                 self?.addLog("<- SetKickitParams error: \(e.localizedDescription)")
             }
@@ -118,13 +279,16 @@ final class NuraDeviceManager: NSObject, ObservableObject {
 
     func setSoundMode(_ mode: NuraPersonalisationMode) {
         guard phase.isReady else { return }
+        // Optimistic update to avoid the segmented control flickering back.
+        let previous = state.personalisationMode
+        state.personalisationMode = mode
         addLog("-> SetPersonalisedMode \(mode.rawValue)")
         sendEncrypted(opcode: cmdSetPersonalisedMode, params: [mode.byte]) { [weak self] result in
             switch result {
             case .success:
-                self?.state.personalisationMode = mode
                 self?.addLog("<- Sound mode \(mode.rawValue)")
             case .failure(let e):
+                self?.state.personalisationMode = previous
                 self?.addLog("<- SetPersonalisedMode error: \(e.localizedDescription)")
             }
         }
@@ -149,9 +313,20 @@ final class NuraDeviceManager: NSObject, ObservableObject {
             case .success:
                 self?.state.profileId = profileId
                 self?.addLog("<- Profile selected: \(profileId)")
+                // Immersion and ANC are per-profile, so re-read them (pure reads)
+                // for the new profile so the controls reflect this profile.
+                self?.refreshProfileScopedState()
             case .failure(let e):
                 self?.addLog("<- SelectProfile error: \(e.localizedDescription)")
             }
+        }
+    }
+
+    /// Re-reads the per-profile values (immersion, ANC) for the current profile.
+    /// These are pure reads and are already part of the safe startup set.
+    private func refreshProfileScopedState() {
+        readAncState { [weak self] in
+            self?.readKickitParams {}
         }
     }
 
@@ -276,17 +451,26 @@ final class NuraDeviceManager: NSObject, ObservableObject {
             expectedAck: cmdGetDeviceInfo | gaiaAckBit
         ) { [weak self] result in
             guard let self else { return }
-            guard case .success(let p) = result, let info = NuraResponseParsers.decodeDeviceInfo(p) else {
-                self.addLog("GetDeviceInfo failed")
-                self.phase = .failed("GetDeviceInfo failed")
+            // SAFETY GATE: the very first exchange must look like a real GAIA
+            // device-info reply. If it doesn't (wrong channel, garbled state),
+            // tear the connection down immediately and send nothing further,
+            // rather than pushing more frames into an unknown channel.
+            guard case .success(let p) = result,
+                  let info = NuraResponseParsers.decodeDeviceInfo(p),
+                  info.serialNumber > 0, info.firmwareVersion > 0 else {
+                self.addLog("GetDeviceInfo failed or implausible - aborting for safety")
+                self.abortForSafety("Unrecognised device response")
                 return
             }
             self.addLog("  device info: \(hexStr(Data(p)))")
             self.state.deviceInfo = info
             self.addLog("  serial=\(info.serialNumber) fw=\(info.firmwareVersion)")
+            if self.mode == .provision {
+                self.runProvisioningRelay(serial: info.serialNumber, firmware: info.firmwareVersion)
+                return
+            }
             guard self.applyConfiguredKey(forSerial: info.serialNumber) else {
-                self.addLog("No key configured for serial \(info.serialNumber) - add it in Devices")
-                self.phase = .failed("Unknown device - add key in Devices")
+                self.abortForSafety("No usable key for this device - recover or re-enter it in Devices")
                 return
             }
             self.runHandshake()
@@ -294,9 +478,20 @@ final class NuraDeviceManager: NSObject, ObservableObject {
     }
 
     private func applyConfiguredKey(forSerial serial: Int) -> Bool {
-        guard let entry = configStore.load().deviceBySerial(String(serial)),
-            let keyBytes = entry.getDeviceKeyBytes()
-        else { return false }
+        let config = configStore.load()
+        guard let entry = config.deviceBySerial(String(serial)) else {
+            addLog("No saved device for serial \(serial). Recover its key from the Devices tab.")
+            return false
+        }
+        guard let keyBytes = entry.getDeviceKeyBytes() else {
+            // The device is known but its key isn't readable. This is almost
+            // always a code-signature change (e.g. switching to a notarised or
+            // hardened build): macOS binds Keychain items to the signing
+            // identity, so a newly-signed build can't read what an earlier build
+            // stored. The key isn't gone; just recover or paste it again here.
+            addLog("Device \(serial) is known but its saved key can't be read (the app's signature changed, e.g. a new notarised build). Re-recover or re-enter the key in the Devices tab; it will then stick.")
+            return false
+        }
         nuraKey = keyBytes
         addLog("  using configured key for serial \(serial)")
         return true
@@ -315,12 +510,12 @@ final class NuraDeviceManager: NSObject, ObservableObject {
             switch result {
             case .failure(let e):
                 self.addLog("Handshake step 1 failed: \(e.localizedDescription)")
-                self.phase = .failed("Handshake failed")
+                self.abortForSafety("Handshake failed")
             case .success(let payload):
                 guard payload.count >= 17, payload[0] == 0 else {
                     let s = payload.first.map { Int($0) } ?? -1
                     self.addLog("CryptoGenerateChallenge status=\(s)")
-                    self.phase = .failed("Handshake status \(s)")
+                    self.abortForSafety("Handshake status \(s)")
                     return
                 }
                 let challenge = Array(payload[1..<17])
@@ -349,12 +544,12 @@ final class NuraDeviceManager: NSObject, ObservableObject {
             switch result {
             case .failure(let e):
                 self.addLog("Handshake step 2 failed: \(e.localizedDescription)")
-                self.phase = .failed("Handshake failed")
+                self.abortForSafety("Handshake failed")
             case .success(let payload):
                 guard payload.count >= 17, payload[0] == 0 else {
                     let s = payload.first.map { Int($0) } ?? -1
                     self.addLog("CryptoValidate status=\(s)")
-                    self.phase = .failed("Handshake status \(s)")
+                    self.abortForSafety("Handshake status \(s)")
                     return
                 }
                 let devGmac = Array(payload[1..<17])
@@ -367,7 +562,7 @@ final class NuraDeviceManager: NSObject, ObservableObject {
                     self.runStartupSequence()
                 } catch {
                     self.addLog("  Device GMAC mismatch - wrong key?")
-                    self.phase = .failed("Crypto: wrong key")
+                    self.abortForSafety("Crypto: wrong key")
                 }
             }
         }
@@ -377,18 +572,189 @@ final class NuraDeviceManager: NSObject, ObservableObject {
 
     private func runStartupSequence() {
         addLog("Reading initial state...")
+        // Only the upstream-proven read set. The extra reads (ANC level,
+        // spatial, button/dial config) were removed after they were implicated
+        // in the device emitting a loud tone on connect.
         readCurrentProfileId { [weak self] in
             self?.readProfileNames {
                 self?.readAncState {
                     self?.readKickitParams {
                         self?.readBattery {
                             self?.readKickitEnabled {
-                                self?.phase = .ready
-                                self?.addLog("Ready")
+                                self?.finishStartup()
                             }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    private func finishStartup() {
+        phase = .ready
+        addLog("Ready")
+        startBatteryTimer()
+        if let serial = state.deviceInfo?.serialNumber {
+            var config = configStore.load()
+            config.lastConnectedSerial = String(serial)
+            configStore.save(config)
+            localProfileNames = loadProfileLabels(serial: serial)
+        }
+    }
+
+    // MARK: - Local (app-side) profile names
+
+    /// The primary name to show for a profile: a user-set app label, else the
+    /// device's own name, else a numbered fallback.
+    func displayProfileName(_ id: Int) -> String {
+        localProfileNames[id] ?? state.profileNames[id] ?? "Profile \(id + 1)"
+    }
+
+    /// The parenthetical detail shown after a custom name: the device's own
+    /// profile name if it has one, else the numbered fallback. Returns nil when
+    /// there's no custom name (so nothing extra is shown).
+    func profileNameDetail(_ id: Int) -> String? {
+        guard localProfileNames[id] != nil else { return nil }
+        return state.profileNames[id] ?? "Profile \(id + 1)"
+    }
+
+    /// Whether the device actually reported a profile in this slot. Slots the
+    /// headphones report no name for are treated as empty.
+    func isProfilePopulated(_ id: Int) -> Bool {
+        state.profileNames[id] != nil
+    }
+
+    /// Renames a profile in the app only (no command is sent to the device).
+    func renameProfile(_ id: Int, to name: String) {
+        guard let serial = state.deviceInfo?.serialNumber else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        var config = configStore.load()
+        var labels = config.profileLabels ?? [:]
+        let key = "\(serial).\(id)"
+        if trimmed.isEmpty {
+            labels[key] = nil
+            localProfileNames[id] = nil
+        } else {
+            labels[key] = trimmed
+            localProfileNames[id] = trimmed
+        }
+        config.profileLabels = labels
+        configStore.save(config)
+    }
+
+    private func loadProfileLabels(serial: Int) -> [Int: String] {
+        let all = configStore.load().profileLabels ?? [:]
+        var out: [Int: String] = [:]
+        for id in 0..<3 {
+            if let name = all["\(serial).\(id)"] { out[id] = name }
+        }
+        return out
+    }
+
+    // MARK: - Profile visualisation
+
+    /// Whether this device's firmware exposes the hearing-profile visualisation
+    /// data. Per the reference capability map, the Nuraphone gains it only on
+    /// firmware newer than 510. If we don't know the firmware yet, assume no.
+    var supportsVisualisation: Bool {
+        (state.deviceInfo?.firmwareVersion ?? 0) > 510
+    }
+
+    /// Reads the visualisation for every populated profile in turn (used by the
+    /// comparison view). Sequential because only one encrypted command is in
+    /// flight at a time. Pure reads; nothing is played.
+    func refreshAllVisualisations() {
+        guard phase.isReady, supportsVisualisation else { return }
+        let ids = [0, 1, 2].filter { isProfilePopulated($0) }
+        readVisualisationChain(ids, index: 0)
+    }
+
+    private func readVisualisationChain(_ ids: [Int], index: Int) {
+        guard index < ids.count else { return }
+        let profileId = ids[index]
+        sendEncrypted(opcode: cmdGetVisualisationData, params: [UInt8(profileId)]) { [weak self] result in
+            if case .success(let pt) = result,
+               let vis = NuraResponseParsers.decodeVisualisationData(pt) {
+                self?.state.visualisations[profileId] = vis
+                self?.addLog("<- visualisation loaded for profile \(profileId)")
+            }
+            self?.readVisualisationChain(ids, index: index + 1)
+        }
+    }
+
+    // MARK: - Quick actions (used by global hotkeys)
+
+    /// Steps immersion by delta, clamped to the supported -2...4 range. Returns
+    /// the new level for feedback.
+    @discardableResult
+    func immersionStep(_ delta: Int) -> Int {
+        let newLevel = max(-2, min(4, state.immersionLevel + delta))
+        setImmersion(newLevel)
+        return newLevel
+    }
+
+    /// Toggles between ANC and Passthrough (social). If noise control is off,
+    /// turns ANC on. Returns the mode it switched to.
+    @discardableResult
+    func toggleAncSocial() -> NuraAncMode {
+        let current = state.anc?.mode ?? .off
+        let target: NuraAncMode = (current == .anc) ? .passthrough : .anc
+        setAncMode(target)
+        return target
+    }
+
+    /// Cycles to the next/previous populated profile. Returns the profile id it
+    /// switched to, or nil if there are none.
+    @discardableResult
+    func cycleProfile(forward: Bool) -> Int? {
+        let ids = [0, 1, 2].filter { isProfilePopulated($0) }
+        guard !ids.isEmpty else { return nil }
+        let current = state.profileId ?? ids[0]
+        let idx = ids.firstIndex(of: current) ?? 0
+        let nextIdx = forward ? (idx + 1) % ids.count : (idx - 1 + ids.count) % ids.count
+        let target = ids[nextIdx]
+        selectProfile(target)
+        return target
+    }
+
+    /// Reads a profile's hearing-signature visualisation on demand. This is a
+    /// pure read (0x00B8): it fetches stored numbers and plays nothing. It is
+    /// never part of the automatic connect sequence - only the user tapping to
+    /// view a profile triggers it.
+    func refreshVisualisation(profileId: Int) {
+        guard phase.isReady else { return }
+        guard supportsVisualisation else {
+            addLog("Visualisation not supported on this firmware")
+            return
+        }
+        addLog("-> GetVisualisationData profile \(profileId) (requested)")
+        sendEncrypted(opcode: cmdGetVisualisationData, params: [UInt8(profileId)]) { [weak self] result in
+            switch result {
+            case .success(let pt):
+                if let vis = NuraResponseParsers.decodeVisualisationData(pt) {
+                    self?.state.visualisations[profileId] = vis
+                    self?.addLog("<- visualisation loaded for profile \(profileId) (valid=\(vis.valid))")
+                } else {
+                    self?.addLog("<- visualisation: unexpected payload (\(pt.count) bytes)")
+                }
+            case .failure(let e):
+                self?.addLog("<- visualisation error: \(e.localizedDescription)")
+            }
+        }
+    }
+
+    /// Reads the current button configuration on demand (used by the remap
+    /// screen). Not part of the automatic connect sequence.
+    func refreshButtonConfig() {
+        guard phase.isReady else { return }
+        addLog("-> GetButtonConfig (requested)")
+        sendEncrypted(opcode: cmdGetButtonConfigV1, params: [UInt8(state.profileId ?? 0)]) { [weak self] result in
+            if case .success(let pt) = result,
+               let config = NuraResponseParsers.decodeButtonConfiguration(pt, supportsDoubleTap: true, supportsTripleTap: false) {
+                self?.state.buttons = config
+                self?.addLog("<- button config loaded")
+            } else {
+                self?.addLog("<- button config: no data")
             }
         }
     }

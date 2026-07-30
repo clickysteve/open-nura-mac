@@ -130,6 +130,15 @@ func gcmOpenJ0(
     }
     let expected = (ghash(h: h, data: s) ^ U128(bytes: aes.encryptBlock(j0)))
         .toBytes()
-    guard expected == tag else { throw GCMError.tagMismatch }
+    guard constantTimeEqual(expected, tag) else { throw GCMError.tagMismatch }
     return aesCtr(key: key, icb: inc32(j0), data: ciphertext)
+}
+
+/// Compares two byte arrays in constant time to avoid leaking, via timing,
+/// how many leading bytes of an authentication tag matched.
+private func constantTimeEqual(_ a: [UInt8], _ b: [UInt8]) -> Bool {
+    guard a.count == b.count else { return false }
+    var diff: UInt8 = 0
+    for i in 0..<a.count { diff |= a[i] ^ b[i] }
+    return diff == 0
 }

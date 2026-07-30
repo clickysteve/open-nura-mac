@@ -1,0 +1,22 @@
+OpenNura (macOS key-recovery fork)
+Copyright 2026 the OpenNura contributors
+
+This product includes software developed as part of the OpenNura project
+(https://github.com/jamesy0ung/opennura), originally created by James Young.
+
+Portions of the backend-assisted provisioning and key-recovery logic in this
+fork (the app/session, auth, and end_to_end/session/start_N flow, the GAIA
+packet relay, the command-id mappings, the Android app-context payload, and the
+msgpack handling) are a Swift re-implementation derived from the reverse
+engineering and reference implementation in the Nura-Windows project:
+
+    Nura-Windows
+    Copyright 2026 Callum Carmicheal
+    https://github.com/CallumCarmicheal/Nura-Windows
+    Licensed under the Apache License, Version 2.0.
+
+OpenNura as a whole is licensed under the GNU General Public License v3
+(see LICENSE). The Apache-2.0-derived portions above are included under GPLv3,
+which is compatible with Apache 2.0. The Apache License, Version 2.0 requires
+that this NOTICE be retained in distributions of derivative works; a copy of
+that license is provided in LICENSE-APACHE.

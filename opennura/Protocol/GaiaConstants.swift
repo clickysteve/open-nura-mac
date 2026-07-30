@@ -63,7 +63,7 @@ let cmdGetVisualisationData: UInt16 = 0x00B8
 
 // MARK: - Nuraphone BD address suffix for BLE matching
 
-nonisolated(unsafe) let nuraphoneBdAddrSuffix: [UInt8] = [
+let nuraphoneBdAddrSuffix: [UInt8] = [
     0x74, 0x1a, 0xe0, 0x21, 0x07, 0x86,
 ]
 
@@ -142,16 +142,19 @@ func hexStr(_ data: Data?) -> String {
 
 // MARK: - Immersion parameter lookup
 
+/// The DRC / LPF / gain tone bytes for a given immersion level. The caller
+/// prepends the target profile id (the full SetKickitParams payload is
+/// [profileId, drc, lpf, gain]).
 func kickitParams(for level: Int) -> [UInt8] {
     switch level {
-    case 4: return [0x00, 0x04, 0x00, 0x02]
-    case 3: return [0x00, 0x03, 0x00, 0x02]
-    case 2: return [0x00, 0x02, 0x02, 0x02]
-    case 1: return [0x00, 0x01, 0x02, 0x02]
-    case 0: return [0x00, 0x00, 0x04, 0x02]
-    case -1: return [0x00, 0x00, 0x04, 0x01]
-    case -2: return [0x00, 0x00, 0x04, 0x00]
-    default: return [0x00, 0x00, 0x04, 0x02]
+    case 4: return [0x04, 0x00, 0x02]
+    case 3: return [0x03, 0x00, 0x02]
+    case 2: return [0x02, 0x02, 0x02]
+    case 1: return [0x01, 0x02, 0x02]
+    case 0: return [0x00, 0x04, 0x02]
+    case -1: return [0x00, 0x04, 0x01]
+    case -2: return [0x00, 0x04, 0x00]
+    default: return [0x00, 0x04, 0x02]
     }
 }
 
